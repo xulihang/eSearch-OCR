@@ -23,6 +23,8 @@ export {
     Det as det,
     /** @deprecated use return obj from init */
     Rec as rec,
+    /** @deprecated use return obj from init */
+    recognize,
     afAfRec as analyzeLayout,
     initDet,
     initRec,
@@ -356,6 +358,12 @@ async function Rec(box: detResultType) {
     return globalOCR.rec(box);
 }
 
+/** @deprecated use return obj from init */
+async function recognize(i: loadImgType) {
+    if (!globalOCR) throw new Error("need init");
+    return globalOCR.recognize(i);
+}
+
 /** 主要操作 */
 async function initOCR(op: InitOcrBase) {
     checkNode();
@@ -368,6 +376,11 @@ async function initOCR(op: InitOcrBase) {
     const docCls = op.docCls ? await initDocDirCls({ ...op.docCls, ...ortO }) : undefined;
     const det = await initDet({ ...op.det, ...ortO });
     const rec = await initRec({ ...op.rec, ...ortO });
+    const recognize = async (srcimg: loadImgType) => {
+        const img = await loadImg(srcimg);
+        return rec.rec(warpDet(img));
+    };
+
     return {
         ocr: async (srcimg: loadImgType) => {
             let img = await loadImg(srcimg);
@@ -390,6 +403,7 @@ async function initOCR(op: InitOcrBase) {
         det: det.det,
         rec: rec.rec,
         recRaw: rec.rawRec,
+        recognize,
     };
 }
 
