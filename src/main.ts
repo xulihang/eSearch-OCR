@@ -63,6 +63,14 @@ type InitDetBase = {
     input: string | ArrayBufferLike | Uint8Array;
     /** can zoom img into smaller size in order to fast, but too small makes the recognition worse */
     ratio?: number;
+    /** threshold for probability map binarization, default 0.3 */
+    det_db_thresh?: number;
+    /** threshold for filtering low-confidence boxes (average score), default 0.5 */
+    det_db_box_thresh?: number;
+    /** ratio for unclipping text boxes, default 2.0 (higher = more padding around text) */
+    det_db_unclip_ratio?: number;
+    /** vertical erosion kernel size to separate close text lines, default 1 (0 to disable) */
+    erode_size?: number;
     /** when finished */
     on?: (r: detResultType) => void;
 };
@@ -221,6 +229,14 @@ async function init(
               imgh?: number;
               /** @deprecated use det.ratio */
               detRatio?: number;
+              /** @deprecated use det.det_db_thresh */
+              det_db_thresh?: number;
+              /** @deprecated use det.det_db_box_thresh */
+              det_db_box_thresh?: number;
+              /** @deprecated use det.det_db_unclip_ratio */
+              det_db_unclip_ratio?: number;
+              /** @deprecated use det.erode_size */
+              erode_size?: number;
               /** @deprecated use det.on and rec.on */
               onProgress?: (type: "det" | "rec", total: number, count: number) => void;
               /** @deprecated use det.on */
@@ -239,6 +255,10 @@ async function init(
                 : {
                       input: op.detPath,
                       ratio: op.detRatio,
+                      det_db_thresh: op.det_db_thresh,
+                      det_db_box_thresh: op.det_db_box_thresh,
+                      det_db_unclip_ratio: op.det_db_unclip_ratio,
+                      erode_size: op.erode_size,
                       on: async (r) => {
                           if (op.onDet) op.onDet(r);
                           if (op.onProgress) op.onProgress("det", 1, 1);
@@ -439,6 +459,10 @@ async function initDet(op: InitDetBase & OrtOption) {
 
     const det = await initOrtModel(op.ort, op.input, op.ortOption);
     if (op.ratio !== undefined) detRatio = op.ratio;
+    const det_db_thresh = op.det_db_thresh ?? 0.3;
+    const det_db_box_thresh = op.det_db_box_thresh ?? 0;
+    const det_db_unclip_ratio = op.det_db_unclip_ratio ?? 2.0;
+    const erode_size = op.erode_size ?? 1;
 
     async function Det(srcimg: ImageData) {
         const img = srcimg;
@@ -460,6 +484,10 @@ async function initDet(op: InitDetBase & OrtOption) {
             resizeW,
             resizeH,
             img,
+            det_db_thresh,
+            det_db_box_thresh,
+            det_db_unclip_ratio,
+            erode_size,
         );
         op?.on?.(box);
 
@@ -597,7 +625,7 @@ function beforeDet(srcImg: ImageData, detRatio: number) {
     return { data: { transposedData, image }, width: resizeW, height: resizeH };
 }
 
-function afterDet(dataSet: detDataType, _resizeW: number, _resizeH: number, srcData: ImageData) {
+function afterDet(dataSet: detDataType, _resizeW: number, _resizeH: number, srcData: ImageData, det_db_thresh = 0.3, det_db_box_thresh = 0.5, det_db_unclip_ratio = 2.0, erode_size = 1) {
     task2.l("");
 
     // 考虑到fill模式，小的不变动
@@ -607,18 +635,37 @@ function afterDet(dataSet: detDataType, _resizeW: number, _resizeH: number, srcD
     const { data, width, height } = dataSet;
     const bitData = new Uint8Array(width * height);
     for (let i = 0; i < data.length; i++) {
-        const v = (data[i] as number) > 0.3 ? 255 : 0;
+        const v = (data[i] as number) > det_db_thresh ? 255 : 0;
         bitData[i] = v;
+    }
+
+    // Vertical-only erosion: erode Npx up/down to break thin bridges between text lines,
+    // while preserving horizontal connections within the same line.
+    let eroded = bitData;
+    for (let e = 0; e < erode_size; e++) {
+        const prev = eroded;
+        eroded = new Uint8Array(width * height);
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const idx = y * width + x;
+                if (prev[idx] === 0) { eroded[idx] = 0; continue; }
+                if ((y > 0 && prev[idx - width] === 0) ||
+                    (y < height - 1 && prev[idx + width] === 0)) {
+                    eroded[idx] = 0;
+                } else {
+                    eroded[idx] = 255;
+                }
+            }
+        }
     }
 
     if (dev) {
         const clipData = new Uint8ClampedArray(width * height * 4);
-        for (let i = 0; i < data.length; i++) {
+        for (let i = 0; i < eroded.length; i++) {
             const n = i * 4;
-            const v = (data[i] as number) > 0.3 ? 255 : 0;
+            const v = eroded[i];
             clipData[n] = clipData[n + 1] = clipData[n + 2] = v;
             clipData[n + 3] = 255;
-            bitData[i] = v;
         }
         const myImageData = createImageData(clipData, width, height);
         const srcCanvas = data2canvas(myImageData);
@@ -631,7 +678,7 @@ function afterDet(dataSet: detDataType, _resizeW: number, _resizeH: number, srcD
 
     const src2: number[][] = [];
     for (let y = 0; y < height; y++) {
-        src2.push(Array.from(bitData.slice(y * width, y * width + width)));
+        src2.push(Array.from(eroded.slice(y * width, y * width + width)));
     }
 
     const contours2: Point[][] = [];
@@ -661,7 +708,7 @@ function afterDet(dataSet: detDataType, _resizeW: number, _resizeH: number, srcD
         if (sside < minSize) continue;
         // TODO sort fast
 
-        const resultObj = unclip2(points);
+        const resultObj = unclip2(points, det_db_unclip_ratio);
         const box = resultObj.points;
         if (resultObj.sside < minSize + 2) {
             continue;
@@ -684,6 +731,13 @@ function afterDet(dataSet: detDataType, _resizeW: number, _resizeH: number, srcD
         const rect_width = int(linalgNorm(box1[0], box1[1]));
         const rect_height = int(linalgNorm(box1[0], box1[3]));
         if (rect_width <= 3 || rect_height <= 3) continue;
+
+        // Box score filtering: skip low-confidence boxes
+        const boxScore = getBoxScore(
+            data as Float32Array, width, height,
+            points, det_db_unclip_ratio,
+        );
+        if (boxScore < det_db_box_thresh) continue;
 
         drawBox(box, "", "red", "det_ru");
 
@@ -745,8 +799,7 @@ function polygonPolygonLength(polygon: pointsType) {
     return perimeter;
 }
 
-function unclip2(box: pointsType) {
-    const unclip_ratio = 1.5;
+function unclip2(box: pointsType, unclip_ratio = 2.0) {
     const area = Math.abs(polygonPolygonArea(box));
     const length = polygonPolygonLength(box);
     const distance = (area * unclip_ratio) / length;
@@ -777,6 +830,44 @@ function unclip2(box: pointsType) {
     const cross = v1[0] * v2[1] - v1[1] * v2[0];
 
     return { points: expandedArr as BoxType, sside: Math.abs(cross) };
+}
+
+/**
+ * Compute average score of probability map within the (unclipped) contour region.
+ * This is used to filter out low-confidence text boxes.
+ */
+function getBoxScore(
+    pdata: Float32Array,
+    pwidth: number,
+    pheight: number,
+    contour: pointsType,
+    unclip_ratio: number,
+) {
+    // Find bounding box of contour
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const p of contour) {
+        minX = Math.min(minX, p[0]);
+        maxX = Math.max(maxX, p[0]);
+        minY = Math.min(minY, p[1]);
+        maxY = Math.max(maxY, p[1]);
+    }
+    // Expand by unclip distance to cover the actual detection region
+    const expandX = (maxX - minX) * (unclip_ratio - 1) * 0.5;
+    const expandY = (maxY - minY) * (unclip_ratio - 1) * 0.5;
+    const x0 = Math.max(0, Math.floor(minX - expandX));
+    const x1 = Math.min(pwidth - 1, Math.ceil(maxX + expandX));
+    const y0 = Math.max(0, Math.floor(minY - expandY));
+    const y1 = Math.min(pheight - 1, Math.ceil(maxY + expandY));
+
+    // Sample full expanded region (PP-OCR probability map has peak values at text boundaries)
+    let sum = 0;
+    const count = (x1 - x0 + 1) * (y1 - y0 + 1);
+    for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) {
+            sum += pdata[y * pwidth + x];
+        }
+    }
+    return count > 0 ? sum / count : 0;
 }
 
 function boxPoints(center: { x: number; y: number }, size: { width: number; height: number }, angle: number) {
