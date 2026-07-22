@@ -1,5 +1,11 @@
 let canvas = (width: number, height: number) => {
-    const c = new OffscreenCanvas(width, height);
+    if (typeof OffscreenCanvas !== 'undefined') {
+        return new OffscreenCanvas(width, height);
+    }
+    // Fallback for browsers without OffscreenCanvas (e.g. iOS < 16.4)
+    const c = document.createElement('canvas');
+    c.width = width;
+    c.height = height;
     return c;
 };
 
