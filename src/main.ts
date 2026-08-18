@@ -88,6 +88,12 @@ type InitRecBase = {
     /** model setting, some model is fixed */
     imgh?: number;
     /**
+     * min height/width ratio to rotate a vertical text crop before recognition,
+     * default 1.5 (1 reproduces the old "rotate when taller than wide" behavior,
+     * set a large number to disable vertical rotation entirely)
+     */
+    verticalRotateRatio?: number;
+    /**
      * when one item finished
      * `index` of input det result
      * when index + 1 === total all done
@@ -229,6 +235,8 @@ async function init(
               log?: boolean;
               /** @deprecated use rec.imgh */
               imgh?: number;
+              /** @deprecated use rec.verticalRotateRatio */
+              verticalRotateRatio?: number;
               /** @deprecated use det.ratio */
               detRatio?: number;
               /** @deprecated use det.det_db_thresh */
@@ -276,6 +284,7 @@ async function init(
                       input: op.recPath,
                       decodeDic: op.dic,
                       imgh: op.imgh,
+                      verticalRotateRatio: op.verticalRotateRatio,
                       on: async (index, result, t) => {
                           if (op.onRec)
                               op.onRec(index, {
@@ -535,11 +544,12 @@ async function initRec(op: InitRecBase & OrtOption) {
     }
     if (op.imgh) imgh = op.imgh;
     const opmSpace = op.optimize?.space === undefined ? true : op.optimize.space;
+    const verticalRotateRatio = op.verticalRotateRatio ?? 1.5;
 
     async function rawRec(box: detResultType, oop?: InitRecBase["multiChar"]) {
         const mainLine: resultType1<CharType> = [];
         task.l("bf_rec");
-        const recL = beforeRec(box, imgh);
+        const recL = beforeRec(box, imgh, verticalRotateRatio);
         let runCount = 0;
         const topK = oop?.topK || op.multiChar?.topK || 2;
         const threshold = oop?.threshold || op.multiChar?.threshold || 0.00001;
@@ -1153,7 +1163,7 @@ function getImgPix(img: ImageData, x: number, y: number) {
     return Array.from(img.data.slice(index, index + 4)) as color;
 }
 
-function beforeRec(box: { box: BoxType; img: ImageData }[], imgH: number) {
+function beforeRec(box: { box: BoxType; img: ImageData }[], imgH: number, verticalRotateRatio = 1.5) {
     const l: { b: number[][][]; imgH: number; imgW: number }[] = [];
     function resizeNormImg(img: ImageData) {
         const w = Math.floor(imgH * (img.width / img.height));
@@ -1164,8 +1174,9 @@ function beforeRec(box: { box: BoxType; img: ImageData }[], imgH: number) {
 
     for (const r of box) {
         let img = r.img;
-        // 模型只支持输入横的图片
-        if (img.width < img.height) {
+        // 模型只支持输入横的图片；但接近方形的（如单个汉字）不旋转，避免被旋转后识别错误。
+        // 仅当高度超过宽度 verticalRotateRatio 倍（默认 1.5）时才旋转成横图，可通过 verticalRotateRatio 参数调整或关闭
+        if (img.height > img.width * verticalRotateRatio) {
             img = rotateImg(img, -90);
         }
         const reImg = resizeNormImg(img);
