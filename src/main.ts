@@ -71,6 +71,8 @@ type InitDetBase = {
     det_db_unclip_ratio?: number;
     /** vertical erosion kernel size to separate close text lines, default 1 (0 to disable) */
     erode_size?: number;
+    /** minimum side length (in det mask pixels) for a text box to be kept, default 3 (lower it for small text) */
+    min_side?: number;
     /** when finished */
     on?: (r: detResultType) => void;
 };
@@ -237,6 +239,8 @@ async function init(
               det_db_unclip_ratio?: number;
               /** @deprecated use det.erode_size */
               erode_size?: number;
+              /** @deprecated use det.min_side */
+              min_side?: number;
               /** @deprecated use det.on and rec.on */
               onProgress?: (type: "det" | "rec", total: number, count: number) => void;
               /** @deprecated use det.on */
@@ -259,6 +263,7 @@ async function init(
                       det_db_box_thresh: op.det_db_box_thresh,
                       det_db_unclip_ratio: op.det_db_unclip_ratio,
                       erode_size: op.erode_size,
+                      min_side: op.min_side,
                       on: async (r) => {
                           if (op.onDet) op.onDet(r);
                           if (op.onProgress) op.onProgress("det", 1, 1);
@@ -463,6 +468,7 @@ async function initDet(op: InitDetBase & OrtOption) {
     const det_db_box_thresh = op.det_db_box_thresh ?? 0;
     const det_db_unclip_ratio = op.det_db_unclip_ratio ?? 2.0;
     const erode_size = op.erode_size ?? 1;
+    const min_side = op.min_side ?? 3;
 
     async function Det(srcimg: ImageData) {
         const img = srcimg;
@@ -488,6 +494,7 @@ async function initDet(op: InitDetBase & OrtOption) {
             det_db_box_thresh,
             det_db_unclip_ratio,
             erode_size,
+            min_side,
         );
         op?.on?.(box);
 
@@ -625,7 +632,7 @@ function beforeDet(srcImg: ImageData, detRatio: number) {
     return { data: { transposedData, image }, width: resizeW, height: resizeH };
 }
 
-function afterDet(dataSet: detDataType, _resizeW: number, _resizeH: number, srcData: ImageData, det_db_thresh = 0.3, det_db_box_thresh = 0.5, det_db_unclip_ratio = 2.0, erode_size = 1) {
+function afterDet(dataSet: detDataType, _resizeW: number, _resizeH: number, srcData: ImageData, det_db_thresh = 0.3, det_db_box_thresh = 0.5, det_db_unclip_ratio = 2.0, erode_size = 1, min_side = 3) {
     task2.l("");
 
     // 考虑到fill模式，小的不变动
@@ -701,7 +708,7 @@ function afterDet(dataSet: detDataType, _resizeW: number, _resizeH: number, srcD
 
     for (let i = 0; i < contours2.length; i++) {
         task2.l("get_box");
-        const minSize = 3;
+        const minSize = min_side;
         const l: Contour = contours2[i];
 
         const { points, sside } = getMiniBoxes(l);
