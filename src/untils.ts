@@ -74,6 +74,10 @@ export function data2canvas(data: ImageData, w?: number, h?: number) {
     ctx.putImageData(data, 0, 0);
     return x;
 }
+/**
+ * 转成 PaddleOCR 输入。注意：PaddleOCR 模型（det/rec/cls）均按 BGR 通道顺序导出
+ * （img_mode: BGR），所以返回值顺序是 [B, G, R]，mean/std 按输出通道顺序应用。
+ */
 export function toPaddleInput(image: ImageData, mean: number[], std: number[]) {
     const imagedata = image.data;
     const redArray: number[][] = [];
@@ -85,9 +89,10 @@ export function toPaddleInput(image: ImageData, mean: number[], std: number[]) {
         if (!blueArray[y]) blueArray[y] = [];
         if (!greenArray[y]) greenArray[y] = [];
         if (!redArray[y]) redArray[y] = [];
-        redArray[y][x] = (imagedata[i] / 255 - mean[0]) / std[0];
+        // imagedata 是 RGBA；输出 [B, G, R]（BGR），mean/std 依次对应 B, G, R
+        blueArray[y][x] = (imagedata[i + 2] / 255 - mean[0]) / std[0];
         greenArray[y][x] = (imagedata[i + 1] / 255 - mean[1]) / std[1];
-        blueArray[y][x] = (imagedata[i + 2] / 255 - mean[2]) / std[2];
+        redArray[y][x] = (imagedata[i] / 255 - mean[2]) / std[2];
         x++;
         if (x === image.width) {
             x = 0;

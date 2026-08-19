@@ -72,6 +72,10 @@ type InitDetBase = {
     det_db_unclip_ratio?: number;
     /** min side length (px) the det input image is scaled up to before detection, matching PaddleOCR DetResizeForTest, default 736 (enlarging small images separates close text lines in the mask) */
     det_limit_side_len?: number;
+    /** det input normalization mean, in BGR order, default [0.485, 0.456, 0.406] (PaddleOCR official). RapidOCR uses [0.5, 0.5, 0.5] — set it here to match RapidOCR output. */
+    mean?: number[];
+    /** det input normalization std, in BGR order, default [0.229, 0.224, 0.225]. RapidOCR uses [0.5, 0.5, 0.5]. */
+    std?: number[];
     /** vertical erosion kernel size to separate close text lines, default 0 (set > 0 to separate dense lines) */
     erode_size?: number;
     /** minimum side length (in det mask pixels) for a text box to be kept, default 3 (lower it for small text) */
@@ -250,6 +254,10 @@ async function init(
               det_db_unclip_ratio?: number;
               /** @deprecated use det.det_limit_side_len */
               det_limit_side_len?: number;
+              /** @deprecated use det.mean */
+              detMean?: number[];
+              /** @deprecated use det.std */
+              detStd?: number[];
               /** @deprecated use det.erode_size */
               erode_size?: number;
               /** @deprecated use det.min_side */
@@ -276,6 +284,8 @@ async function init(
                       det_db_box_thresh: op.det_db_box_thresh,
                       det_db_unclip_ratio: op.det_db_unclip_ratio,
                       det_limit_side_len: op.det_limit_side_len,
+                      mean: op.detMean,
+                      std: op.detStd,
                       erode_size: op.erode_size,
                       min_side: op.min_side,
                       on: async (r) => {
@@ -485,6 +495,8 @@ async function initDet(op: InitDetBase & OrtOption) {
     const erode_size = op.erode_size ?? 0;
     const min_side = op.min_side ?? 3;
     const det_limit_side_len = op.det_limit_side_len ?? 736;
+    const detMean = op.mean ?? [0.485, 0.456, 0.406];
+    const detStd = op.std ?? [0.229, 0.224, 0.225];
 
     async function Det(srcimg: ImageData) {
         const img = srcimg;
@@ -495,7 +507,7 @@ async function initDet(op: InitDetBase & OrtOption) {
         }
 
         task.l("pre_det");
-        const { data: beforeDetData, width: resizeW, height: resizeH } = beforeDet(img, detRatio, det_limit_side_len);
+        const { data: beforeDetData, width: resizeW, height: resizeH } = beforeDet(img, detRatio, det_limit_side_len, detMean, detStd);
         const { transposedData, image } = beforeDetData;
         task.l("det");
         const detResults = await runDet(transposedData, image, det, op.ort);
@@ -629,7 +641,7 @@ async function runRec(b: number[][][], imgH: number, imgW: number, rec: SessionT
     return recResults[rec.outputNames[0]];
 }
 
-function beforeDet(srcImg: ImageData, detRatio: number, limitSideLen = 736) {
+function beforeDet(srcImg: ImageData, detRatio: number, limitSideLen = 736, mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225]) {
     // 对齐 PaddleOCR DetResizeForTest：小图放大到最短边 = limitSideLen，
     // 让行间距离在掩膜里拉开，避免多行粘连成一个框（默认 ratio >= 1 时生效）。
     const minSide = Math.min(srcImg.height, srcImg.width);
@@ -648,7 +660,8 @@ function beforeDet(srcImg: ImageData, detRatio: number, limitSideLen = 736) {
     // 拉伸到目标尺寸（小图不再用 fill 留白，而是放大参与检测）
     const image = resizeImg(srcImg, resizeW, resizeH);
 
-    const transposedData = toPaddleInput(image, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]);
+    // mean/std 按 BGR 顺序对应 [B, G, R]，与 PaddleOCR det（img_mode: BGR）一致
+    const transposedData = toPaddleInput(image, mean, std);
     log(image);
     if (dev) {
         const srcCanvas = data2canvas(image);
