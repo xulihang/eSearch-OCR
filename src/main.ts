@@ -10,6 +10,7 @@ import {
     int,
     tLog,
     clip,
+    warpPerspective,
 } from "./untils";
 import { type Contour, findContours, minAreaRect, type Point } from "./cv";
 
@@ -69,7 +70,7 @@ type InitDetBase = {
     det_db_box_thresh?: number;
     /** ratio for unclipping text boxes, default 2.0 (higher = more padding around text) */
     det_db_unclip_ratio?: number;
-    /** vertical erosion kernel size to separate close text lines, default 1 (0 to disable) */
+    /** vertical erosion kernel size to separate close text lines, default 0 (set > 0 to separate dense lines) */
     erode_size?: number;
     /** minimum side length (in det mask pixels) for a text box to be kept, default 3 (lower it for small text) */
     min_side?: number;
@@ -474,9 +475,9 @@ async function initDet(op: InitDetBase & OrtOption) {
     const det = await initOrtModel(op.ort, op.input, op.ortOption);
     if (op.ratio !== undefined) detRatio = op.ratio;
     const det_db_thresh = op.det_db_thresh ?? 0.3;
-    const det_db_box_thresh = op.det_db_box_thresh ?? 0;
+    const det_db_box_thresh = op.det_db_box_thresh ?? 0.5;
     const det_db_unclip_ratio = op.det_db_unclip_ratio ?? 2.0;
-    const erode_size = op.erode_size ?? 1;
+    const erode_size = op.erode_size ?? 0;
     const min_side = op.min_side ?? 3;
 
     async function Det(srcimg: ImageData) {
@@ -642,7 +643,7 @@ function beforeDet(srcImg: ImageData, detRatio: number) {
     return { data: { transposedData, image }, width: resizeW, height: resizeH };
 }
 
-function afterDet(dataSet: detDataType, _resizeW: number, _resizeH: number, srcData: ImageData, det_db_thresh = 0.3, det_db_box_thresh = 0.5, det_db_unclip_ratio = 2.0, erode_size = 1, min_side = 3) {
+function afterDet(dataSet: detDataType, _resizeW: number, _resizeH: number, srcData: ImageData, det_db_thresh = 0.3, det_db_box_thresh = 0.5, det_db_unclip_ratio = 2.0, erode_size = 0, min_side = 3) {
     task2.l("");
 
     // 考虑到fill模式，小的不变动
@@ -750,9 +751,9 @@ function afterDet(dataSet: detDataType, _resizeW: number, _resizeH: number, srcD
         if (rect_width <= 3 || rect_height <= 3) continue;
 
         // Box score filtering: skip low-confidence boxes
-        const boxScore = getBoxScore(
+        const boxScore = boxScoreFast(
             data as Float32Array, width, height,
-            points, det_db_unclip_ratio,
+            points,
         );
         if (boxScore < det_db_box_thresh) continue;
 
@@ -850,41 +851,57 @@ function unclip2(box: pointsType, unclip_ratio = 2.0) {
 }
 
 /**
- * Compute average score of probability map within the (unclipped) contour region.
- * This is used to filter out low-confidence text boxes.
+ * Compute average score of probability map within the (un-unclipped) min-area box.
+ * Matches PaddleOCR/RapidOCR box_score_fast: average only inside the polygon
+ * (not the bounding box), so background pixels don't dilute the score.
  */
-function getBoxScore(
+function boxScoreFast(
     pdata: Float32Array,
     pwidth: number,
     pheight: number,
-    contour: pointsType,
-    unclip_ratio: number,
+    box: pointsType,
 ) {
-    // Find bounding box of contour
+    // Find bounding box of the quad
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    for (const p of contour) {
+    for (const p of box) {
         minX = Math.min(minX, p[0]);
         maxX = Math.max(maxX, p[0]);
         minY = Math.min(minY, p[1]);
         maxY = Math.max(maxY, p[1]);
     }
-    // Expand by unclip distance to cover the actual detection region
-    const expandX = (maxX - minX) * (unclip_ratio - 1) * 0.5;
-    const expandY = (maxY - minY) * (unclip_ratio - 1) * 0.5;
-    const x0 = Math.max(0, Math.floor(minX - expandX));
-    const x1 = Math.min(pwidth - 1, Math.ceil(maxX + expandX));
-    const y0 = Math.max(0, Math.floor(minY - expandY));
-    const y1 = Math.min(pheight - 1, Math.ceil(maxY + expandY));
+    const xMin = Math.max(0, Math.min(Math.floor(minX), pwidth - 1));
+    const xMax = Math.max(0, Math.min(Math.ceil(maxX), pwidth - 1));
+    const yMin = Math.max(0, Math.min(Math.floor(minY), pheight - 1));
+    const yMax = Math.max(0, Math.min(Math.ceil(maxY), pheight - 1));
+    if (xMax <= xMin || yMax <= yMin) return 0;
 
-    // Sample full expanded region (PP-OCR probability map has peak values at text boundaries)
     let sum = 0;
-    const count = (x1 - x0 + 1) * (y1 - y0 + 1);
-    for (let y = y0; y <= y1; y++) {
-        for (let x = x0; x <= x1; x++) {
-            sum += pdata[y * pwidth + x];
+    let count = 0;
+    for (let y = yMin; y <= yMax; y++) {
+        for (let x = xMin; x <= xMax; x++) {
+            if (pointInQuad([x + 0.5, y + 0.5], box)) {
+                sum += pdata[y * pwidth + x];
+                count++;
+            }
         }
     }
     return count > 0 ? sum / count : 0;
+}
+
+/** 点在凸四边形内（跨积同号，含边界） */
+function pointInQuad(p: pointType, quad: pointsType) {
+    let sign = 0;
+    for (let i = 0; i < 4; i++) {
+        const a = quad[i];
+        const b = quad[(i + 1) % 4];
+        const cross = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+        if (cross !== 0) {
+            const s = cross > 0 ? 1 : -1;
+            if (sign === 0) sign = s;
+            else if (s !== sign) return false;
+        }
+    }
+    return true;
 }
 
 function boxPoints(center: { x: number; y: number }, size: { width: number; height: number }, angle: number) {
@@ -982,10 +999,38 @@ function orderPointsClockwise(pts: BoxType) {
 function getRotateCropImage(img: ImageData, points: BoxType) {
     // todo 根据曲线裁切
     const [p0, p1, p2, p3] = points.map((p) => ({ x: p[0], y: p[1] }));
-    // 计算原始宽高
-    const width = Math.sqrt((p1.x - p0.x) ** 2 + (p1.y - p0.y) ** 2);
-    const height = Math.sqrt((p3.x - p0.x) ** 2 + (p3.y - p0.y) ** 2);
 
+    // 宽高取对边较大值，透视/倾斜下更稳（与 RapidOCR 一致）
+    const width = Math.max(
+        Math.hypot(p1.x - p0.x, p1.y - p0.y),
+        Math.hypot(p2.x - p3.x, p2.y - p3.y),
+    );
+    const height = Math.max(
+        Math.hypot(p3.x - p0.x, p3.y - p0.y),
+        Math.hypot(p2.x - p1.x, p2.y - p1.y),
+    );
+    if (width < 1 || height < 1) throw new Error("点共线，无法形成矩形");
+
+    // 优先用透视变换矫正（四点不构成平行四边形时比仿射更准）
+    const warp = warpPerspective(
+        img,
+        Math.ceil(width),
+        Math.ceil(height),
+        [
+            [p0.x, p0.y],
+            [p1.x, p1.y],
+            [p2.x, p2.y],
+            [p3.x, p3.y],
+        ],
+    );
+    if (warp) return createImageData(warp.data, warp.width, warp.height);
+
+    // 单应矩阵退化时回退到仿射变换
+    return affineCrop(img, p0, p1, p3, width, height);
+}
+
+/** 仿射变换裁切（透视变换无法求解时的回退路径） */
+function affineCrop(img: ImageData, p0: { x: number; y: number }, p1: { x: number; y: number }, p3: { x: number; y: number }, width: number, height: number) {
     // 计算变换矩阵参数
     const dx1 = p1.x - p0.x;
     const dy1 = p1.y - p0.y;
@@ -1167,7 +1212,7 @@ function beforeRec(box: { box: BoxType; img: ImageData }[], imgH: number, vertic
     const l: { b: number[][][]; imgH: number; imgW: number }[] = [];
     function resizeNormImg(img: ImageData) {
         const w = Math.floor(imgH * (img.width / img.height));
-        const d = resizeImg(img, w, imgH, undefined, false);
+        const d = resizeImg(img, w, imgH, undefined, "high");
         if (dev) putImgDom(data2canvas(d, w, imgH));
         return { data: d, w, h: imgH };
     }

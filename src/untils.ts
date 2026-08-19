@@ -97,6 +97,104 @@ export function toPaddleInput(image: ImageData, mean: number[], std: number[]) {
 
     return [blueArray, greenArray, redArray];
 }
+/**
+ * 用 DLT 求解单应矩阵 H（h22 = 1），使得每组对应点 (x,y)->(u,v) 满足：
+ *   u = (h0*x + h1*y + h2) / (h6*x + h7*y + 1)
+ *   v = (h3*x + h4*y + h5) / (h6*x + h7*y + 1)
+ * 奇异时返回 null。
+ */
+export function solveHomography(src: [number, number][], dst: [number, number][]): number[] | null {
+    // 8x8 线性方程组
+    const a: number[][] = [];
+    const b: number[] = [];
+    for (let i = 0; i < 4; i++) {
+        const [x, y] = src[i];
+        const [u, v] = dst[i];
+        a.push([x, y, 1, 0, 0, 0, -u * x, -u * y]);
+        b.push(u);
+        a.push([0, 0, 0, x, y, 1, -v * x, -v * y]);
+        b.push(v);
+    }
+    // 高斯消元（列主元）
+    const m = a.map((row, r) => [...row, b[r]]);
+    for (let col = 0; col < 8; col++) {
+        let piv = col;
+        for (let r = col + 1; r < 8; r++) {
+            if (Math.abs(m[r][col]) > Math.abs(m[piv][col])) piv = r;
+        }
+        if (Math.abs(m[piv][col]) < 1e-12) return null;
+        [m[col], m[piv]] = [m[piv], m[col]];
+        for (let r = 0; r < 8; r++) {
+            if (r === col) continue;
+            const f = m[r][col] / m[col][col];
+            for (let c = col; c <= 8; c++) m[r][c] -= f * m[col][c];
+        }
+    }
+    return m.map((row, r) => row[8] / m[r][r]);
+}
+
+/**
+ * 透视变换：把源图中四边形 quad 映射到 (dstW, dstH) 的矩形（比仿射更精确地矫正透视）。
+ * 逐像素用逆映射做双线性采样，越界取最近边缘像素（等效 BORDER_REPLICATE）。
+ * 单应矩阵求解失败时返回 null，调用方回退到仿射路径。
+ */
+export function warpPerspective(
+    src: ImageData,
+    dstW: number,
+    dstH: number,
+    quad: [number, number][],
+): { data: Uint8ClampedArray; width: number; height: number } | null {
+    // 目标矩形四角 -> 源四边形（逆映射，便于逐像素反查源图）
+    const h = solveHomography(
+        [
+            [0, 0],
+            [dstW, 0],
+            [dstW, dstH],
+            [0, dstH],
+        ],
+        quad,
+    );
+    if (!h) return null;
+
+    const [h0, h1, h2, h3, h4, h5, h6, h7] = h;
+    const sw = src.width;
+    const sh = src.height;
+    const sData = src.data;
+    const out = new Uint8ClampedArray(dstW * dstH * 4);
+
+    for (let y = 0; y < dstH; y++) {
+        for (let x = 0; x < dstW; x++) {
+            const denom = h6 * x + h7 * y + 1;
+            const sx = (h0 * x + h1 * y + h2) / denom;
+            const sy = (h3 * x + h4 * y + h5) / denom;
+            const x0 = Math.floor(sx);
+            const y0 = Math.floor(sy);
+            const fx = sx - x0;
+            const fy = sy - y0;
+            const cx0 = clip(x0, 0, sw - 1);
+            const cy0 = clip(y0, 0, sh - 1);
+            const cx1 = clip(x0 + 1, 0, sw - 1);
+            const cy1 = clip(y0 + 1, 0, sh - 1);
+            const i00 = (cy0 * sw + cx0) * 4;
+            const i10 = (cy0 * sw + cx1) * 4;
+            const i01 = (cy1 * sw + cx0) * 4;
+            const i11 = (cy1 * sw + cx1) * 4;
+            const o = (y * dstW + x) * 4;
+            for (let c = 0; c < 3; c++) {
+                const v00 = sData[i00 + c];
+                const v10 = sData[i10 + c];
+                const v01 = sData[i01 + c];
+                const v11 = sData[i11 + c];
+                const top = v00 + (v10 - v00) * fx;
+                const bot = v01 + (v11 - v01) * fx;
+                out[o + c] = top + (bot - top) * fy;
+            }
+            out[o + 3] = 255;
+        }
+    }
+    return { data: out, width: dstW, height: dstH };
+}
+
 export type AsyncType<T> = T extends Promise<infer U> ? U : never;
 export type SessionType = AsyncType<ReturnType<typeof import("onnxruntime-common").InferenceSession.create>>;
 
