@@ -68,8 +68,10 @@ type InitDetBase = {
     det_db_thresh?: number;
     /** threshold for filtering low-confidence boxes (average score), default 0.5 */
     det_db_box_thresh?: number;
-    /** ratio for unclipping text boxes, default 2.0 (higher = more padding around text) */
+    /** ratio for unclipping text boxes, default 1.6 (higher = more padding around text, more prone to merge adjacent lines) */
     det_db_unclip_ratio?: number;
+    /** min side length (px) the det input image is scaled up to before detection, matching PaddleOCR DetResizeForTest, default 736 (enlarging small images separates close text lines in the mask) */
+    det_limit_side_len?: number;
     /** vertical erosion kernel size to separate close text lines, default 0 (set > 0 to separate dense lines) */
     erode_size?: number;
     /** minimum side length (in det mask pixels) for a text box to be kept, default 3 (lower it for small text) */
@@ -246,6 +248,8 @@ async function init(
               det_db_box_thresh?: number;
               /** @deprecated use det.det_db_unclip_ratio */
               det_db_unclip_ratio?: number;
+              /** @deprecated use det.det_limit_side_len */
+              det_limit_side_len?: number;
               /** @deprecated use det.erode_size */
               erode_size?: number;
               /** @deprecated use det.min_side */
@@ -271,6 +275,7 @@ async function init(
                       det_db_thresh: op.det_db_thresh,
                       det_db_box_thresh: op.det_db_box_thresh,
                       det_db_unclip_ratio: op.det_db_unclip_ratio,
+                      det_limit_side_len: op.det_limit_side_len,
                       erode_size: op.erode_size,
                       min_side: op.min_side,
                       on: async (r) => {
@@ -476,9 +481,10 @@ async function initDet(op: InitDetBase & OrtOption) {
     if (op.ratio !== undefined) detRatio = op.ratio;
     const det_db_thresh = op.det_db_thresh ?? 0.3;
     const det_db_box_thresh = op.det_db_box_thresh ?? 0.5;
-    const det_db_unclip_ratio = op.det_db_unclip_ratio ?? 2.0;
+    const det_db_unclip_ratio = op.det_db_unclip_ratio ?? 1.6;
     const erode_size = op.erode_size ?? 0;
     const min_side = op.min_side ?? 3;
+    const det_limit_side_len = op.det_limit_side_len ?? 736;
 
     async function Det(srcimg: ImageData) {
         const img = srcimg;
@@ -489,7 +495,7 @@ async function initDet(op: InitDetBase & OrtOption) {
         }
 
         task.l("pre_det");
-        const { data: beforeDetData, width: resizeW, height: resizeH } = beforeDet(img, detRatio);
+        const { data: beforeDetData, width: resizeW, height: resizeH } = beforeDet(img, detRatio, det_limit_side_len);
         const { transposedData, image } = beforeDetData;
         task.l("det");
         const detResults = await runDet(transposedData, image, det, op.ort);
@@ -623,16 +629,24 @@ async function runRec(b: number[][][], imgH: number, imgW: number, rec: SessionT
     return recResults[rec.outputNames[0]];
 }
 
-function beforeDet(srcImg: ImageData, detRatio: number) {
-    const resizeH = Math.max(Math.round((srcImg.height * detRatio) / 32) * 32, 32);
-    const resizeW = Math.max(Math.round((srcImg.width * detRatio) / 32) * 32, 32);
+function beforeDet(srcImg: ImageData, detRatio: number, limitSideLen = 736) {
+    // 对齐 PaddleOCR DetResizeForTest：小图放大到最短边 = limitSideLen，
+    // 让行间距离在掩膜里拉开，避免多行粘连成一个框（默认 ratio >= 1 时生效）。
+    const minSide = Math.min(srcImg.height, srcImg.width);
+    let scale = detRatio;
+    if (detRatio >= 1 && minSide < limitSideLen) {
+        scale = Math.max(scale, limitSideLen / minSide);
+    }
+    const resizeH = Math.max(Math.round((srcImg.height * scale) / 32) * 32, 32);
+    const resizeW = Math.max(Math.round((srcImg.width * scale) / 32) * 32, 32);
 
     if (dev) {
         const srcCanvas = data2canvas(srcImg);
         putImgDom(srcCanvas);
     }
 
-    const image = resizeImg(srcImg, resizeW, resizeH, "fill");
+    // 拉伸到目标尺寸（小图不再用 fill 留白，而是放大参与检测）
+    const image = resizeImg(srcImg, resizeW, resizeH);
 
     const transposedData = toPaddleInput(image, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]);
     log(image);
@@ -643,12 +657,12 @@ function beforeDet(srcImg: ImageData, detRatio: number) {
     return { data: { transposedData, image }, width: resizeW, height: resizeH };
 }
 
-function afterDet(dataSet: detDataType, _resizeW: number, _resizeH: number, srcData: ImageData, det_db_thresh = 0.3, det_db_box_thresh = 0.5, det_db_unclip_ratio = 2.0, erode_size = 0, min_side = 3) {
+function afterDet(dataSet: detDataType, _resizeW: number, _resizeH: number, srcData: ImageData, det_db_thresh = 0.3, det_db_box_thresh = 0.5, det_db_unclip_ratio = 1.6, erode_size = 0, min_side = 3) {
     task2.l("");
 
-    // 考虑到fill模式，小的不变动
-    const w = Math.min(srcData.width, _resizeW);
-    const h = Math.min(srcData.height, _resizeH);
+    // 掩膜覆盖整个 resizeW×resizeH，坐标按全图缩放比例映射回原图
+    const w = _resizeW;
+    const h = _resizeH;
 
     const { data, width, height } = dataSet;
     const bitData = new Uint8Array(width * height);
